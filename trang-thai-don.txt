@@ -1,0 +1,59 @@
+================================================================================
+BÁO CÁO KỸ THUẬT: ĐIỀU PHỐI VÀ KIỂM SOÁT TRẠNG THÁI ĐƠN HÀNG THEO TỪNG LỰA CHỌN
+DỰ ÁN: CLUCKY – VIETNAMESE FAST-FOOD ORDERING PLATFORM
+Ngày lập: 20/11/2026
+Mã nguồn đối chiếu: backend/cart-order-service, backend/payment-service, frontend/
+================================================================================
+
+1. TRIẾT LÝ KIẾN TRÚC: TÁCH ĐÔI HAI TRỤC TRẠNG THÁI ĐỘC LẬP
+Hệ thống Clucky không sử dụng một máy trạng thái tuyến tính đơn giản mà tách biệt thành 2 trục độc lập:
+- Trục Tiến độ Món ăn (status):
+  PENDING_STOCK -> PENDING_PAYMENT / CONFIRMED -> PREPARING -> READY -> SHIPPING -> COMPLETED (hoặc CANCELLED, DELIVERY_FAILED)
+- Trục Dòng tiền & Tài chính (paymentStatus):
+  PENDING -> PAID (ngân hàng xác nhận) hoặc COLLECTED (tiền mặt vào két / đối soát xong)
+
+Quy tắc vàng: Bếp có thể nấu trước khi tiền vào (đơn quầy, đơn web tự lấy, COD), nhưng thời điểm Bàn giao (COMPLETED) bắt buộc tiền phải vào két hoặc tài khoản (PAID / COLLECTED) thì mới được xuất món!
+
+2. MA TRẬN 4 CHIỀU PHÂN NHÁNH NGHIỆP VỤ:
+- Chiều 1 (orderSource): WEB (khách đặt online) vs COUNTER (nhân viên quầy nhập POS).
+- Chiều 2 (type / diningOption): DELIVERY (giao hàng), PICKUP / TAKE_AWAY (mang về), DINE_IN (ăn tại quán - cấp queueNumber 1-999).
+- Chiều 3 (paymentMethod): COD (thu hộ khi giao), BANK_TRANSFER (VietQR SePay), CASH (tiền mặt), SPLIT (kết hợp tiền mặt + VietQR).
+- Chiều 4 (Actor Authority): Staff chỉ chuyển bước bếp; Shipping Simulator độc quyền chuyển SHIPPING/COMPLETED cho đơn giao; Ngân hàng độc quyền cập nhật PAID.
+
+3. BỐN NHÁNH ĐIỀU PHỐI ĐIỂN HÌNH:
+- Nhánh 1: Web Delivery + VietQR:
+  + Khởi tạo: status = PENDING_PAYMENT, paymentStatus = PENDING.
+  + Khách quét VietQR -> SePay Webhook -> paymentStatus = PAID, status = CONFIRMED.
+  + Bếp làm món: PREPARING -> READY.
+  + Shipper mô phỏng nhận đơn -> SHIPPING -> COMPLETED.
+  + Staff không được phép bấm hoàn tất thủ công đơn giao hàng.
+
+- Nhánh 2: Web Delivery + COD:
+  + Khởi tạo: status = CONFIRMED, paymentStatus = PENDING (bảo chứng làm món ngay).
+  + Bếp làm món: PREPARING -> READY.
+  + Shipper nhận hàng: Hệ thống ghi nhận merchantPaymentStatus = 'PAID_SIMULATED' (tài xế ứng tiền cho quán).
+  + Giao thành công: status = COMPLETED (paymentStatus khách vẫn PENDING đúng kế toán COD).
+
+- Nhánh 3: Web Pickup + Tiền mặt tại quầy:
+  + Khởi tạo: status = CONFIRMED, paymentStatus = PENDING (nấu trước để khách tới có ngay).
+  + Bếp làm: PREPARING -> READY.
+  + Khách đến quầy: Nút bàn giao bị khóa, hiện nút 'Thu tiền quầy'.
+  + Staff thu tiền -> payment-service lưu biên lai -> paymentStatus = COLLECTED.
+  + Nút bàn giao mới sáng để chuyển COMPLETED. Nếu staff cố bấm hoàn tất trước, backend ném lỗi 409 Conflict.
+
+- Nhánh 4: POS Counter Order + Tiền mặt / VietQR / SPLIT:
+  + Cấp queueNumber tự tăng 1-999 qua Redis INCR. Vào thẳng CONFIRMED để in phiếu bếp KOT.
+  + Hỗ trợ thu tiền ngay hoặc thu sau khi làm món.
+  + Hỗ trợ thanh toán SPLIT: 1 phần tiền mặt, phần còn lại tạo mã VietQR SePay.
+  + Staff không được xác nhận chuyển khoản thủ công nếu không có webhook thật từ ngân hàng.
+
+4. CÁC ĐIỂM SÁNG KỸ THUẬT ĐÃ GIẢI QUYẾT:
+- Chặn cập nhật paymentStatus ở API trạng thái đơn (OrderService.java:1225-1227).
+- Cấm hủy đơn khi đã vào bếp: PREPARING hoặc READY không thể chuyển CANCELLED (OrderService.java:1216-1221).
+- Phân định quyền lực giữa Người & Vận chuyển mô phỏng (OrderService.java:1212-1215).
+- Xử lý đơn hàng 0 VNĐ do voucher/điểm: Tự động gán paymentStatus = COLLECTED, collectionMethod = 'NO_PAYMENT' (OrderService.java:535-543).
+- Cấn trừ ưu đãi chặt chẽ: Điểm và voucher chỉ giảm tiền món, không bao giờ trừ vào phí ship.
+
+================================================================================
+HẾT BÁO CÁO
+================================================================================

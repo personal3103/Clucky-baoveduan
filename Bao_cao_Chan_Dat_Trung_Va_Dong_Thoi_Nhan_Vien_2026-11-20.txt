@@ -1,0 +1,80 @@
+========================================================================================
+BÁO CÁO KỸ THUẬT: GIẢI PHÁP CHẶN ĐẶT TRÙNG MÓN VÀ CHẶN 2 NHÂN VIÊN THAO TÁC TRÊN 1 TÀI KHOẢN
+Hệ thống: Clucky Platform - Nền tảng Đặt đồ ăn nhanh Đa dịch vụ
+Ngày lập: 20/11/2026
+Mã nguồn đối chiếu: backend/cart-order-service, backend/auth-service, backend/inventory-service
+========================================================================================
+
+I. BÀI TOÁN 1: CHẶN ĐẶT TRÙNG 1 MÓN VÀ CHỐNG ĐẶT ĐƠN TRÙNG LẶP (IDEMPOTENCY & DEDUPLICATION)
+----------------------------------------------------------------------------------------
+1. Bối cảnh và Rủi ro:
+- Khách hàng bấm nút "Thanh toán" hoặc "Thêm vào giỏ" nhiều lần do mạng chập chờn (double-click).
+- Mạng lag khiến request HTTP đầu tiên gửi đi nhưng response chưa kịp trả về, người dùng sốt ruột bấm tiếp.
+- Hậu quả nếu không chặn: Khách bị trừ tiền 2 lần, tạo 2 đơn hàng trùng khớp, bếp nấu thừa 2 phần ăn giống nhau, kho bị trừ âm tồn kho ảo.
+
+2. Giải pháp kỹ thuật đa tầng trong Clucky:
+
+a. Chặn trùng món trong Giỏ hàng (Canonical Item Key Aggregation):
+- Khi khách hàng thêm món có customization (tùy chọn: size, vị gà sốt cay, không hành, v.v.):
+- Hệ thống sinh canonical MD5 hash (itemKey) đại diện cho tổ hợp món + modifier đã chuẩn hóa thứ tự:
+    itemKey = md5(productId + ":" + sorted(modifiers))
+- Khi thêm vào giỏ, nếu cùng `itemKey`, hệ thống chỉ tăng số lượng `quantity = quantity + 1` chứ không sinh 2 dòng riêng biệt gây rối rắm đơn hàng.
+
+b. Chống gửi trùng đơn thanh toán bằng Khóa lũy kế (Idempotency Key):
+- Tại tầng Checkout API, client bắt buộc phải gửi kèm header `Idempotency-Key` (UUID duy nhất do frontend sinh khi mở màn hình thanh toán).
+- Backend lưu trạng thái xử lý vào Redis với cơ chế SETNX:
+    `SET idempotency:<idempotency_key> "PROCESSING" EX 120 NX`
+- Nếu phát hiện key đang tồn tại:
+  + Nếu trạng thái là `PROCESSING`: Trả về lỗi `409 Conflict` hoặc chờ đợi kết quả xử lý của request gốc.
+  + Nếu trạng thái là `DONE`: Trả về ngay payload kết quả của đơn hàng trước đó mà KHÔNG tạo đơn mới hay trừ kho lần thứ hai.
+
+c. Phân tán giữ kho (Distributed Stock Reservation Saga):
+- Khi đơn hàng tạo ở trạng thái `PENDING_STOCK`, `cart-order-service` phát sự kiện sang `inventory-service` để giữ nguyên tử (Reserve Stock).
+- Nếu kho thiếu hoặc hết hàng, đơn hàng lập tức bị hủy (`CANCELLED_OUT_OF_STOCK`), không cho phép giữ kho vượt quá khả năng phục vụ.
+
+
+II. BÀI TOÁN 2: CHẶN 2 NHÂN VIÊN THAO TÁC CÙNG LÚC TRÊN 1 TÀI KHOẢN (CONCURRENT SESSION CONTROL)
+----------------------------------------------------------------------------------------
+1. Bối cảnh và Rủi ro:
+- Tại các cửa hàng ăn nhanh, nhân viên quầy POS hoặc quản lý ca thường có thói quen dùng chung một tài khoản đăng nhập (ví dụ: `cashier_store01`).
+- Nếu 2 nhân viên cùng đăng nhập và thao tác bán hàng, tính tiền, in hóa đơn trên 2 máy POS khác nhau cùng lúc:
+  + Dẫn đến sai lệch số liệu két tiền mặt (Cash Drawer Discrepancy).
+  + Xung đột cập nhật đơn hàng: Nhân viên A bấm hoàn thành đơn, Nhân viên B bấm hủy đơn cùng lúc.
+  + Mất dấu trách nhiệm kiểm toán: Khi thất thoát tiền hoặc sai lệch món ăn, không thể quy trách nhiệm thuộc về ai trong ca làm việc.
+
+2. Quy định nghiêm ngặt theo chính sách hệ thống (SESSION_POLICY.md):
+- Nguyên tắc cốt lõi: "Single Active Session per Staff/Store Account" (Mỗi tài khoản nội bộ chỉ được phép tồn tại 1 phiên làm việc hoạt động duy nhất).
+- Cơ chế từ chối cứng (Strict Rejection - NO AUTO-KICK):
+  + Khi một nhân viên cố gắng đăng nhập vào tài khoản ĐANG CÓ NGƯỜI SỬ DỤNG, hệ thống từ chối thẳng thừng bằng HTTP 409 Conflict với mã lỗi `sessionLimit = REACHED`.
+  + Tuyệt đối KHÔNG tự động đá (auto-kick) phiên của nhân viên đang làm việc, nhằm bảo vệ phiên làm việc của nhân viên đang thu ngân không bị gián đoạn giữa chừng.
+  + Muốn đăng nhập ca mới, nhân viên ca trước BẮT BUỘC phải bấm Đăng xuất (Logout) hợp lệ hoặc Quản lý cấp cao phải thu hồi phiên chủ động.
+
+3. Triển khai kỹ thuật chi tiết:
+
+a. Khóa dòng cấp Cơ sở dữ liệu (Database Row Lock `SELECT ... FOR UPDATE`):
+- Trong `AuthSessionService.java` (`auth-service`):
+  Khi nhận request đăng nhập, service thực hiện câu lệnh SQL:
+    `SELECT * FROM users WHERE username = ? FOR UPDATE;`
+  -> Khóa dòng user này trong database để ngăn chặn 2 request đăng nhập đồng thời vượt qua validation cùng 1 tích tắc.
+- Kiểm tra số lượng phiên đang hoạt động trong bảng `user_sessions`. Nếu số phiên active >= maxAllowed (1 đối với STAFF):
+  -> Ném `SessionLimitReachedException(409 Conflict)`.
+
+b. Danh sách đen thu hồi phân tán tức thì (Redis Token Denylist):
+- Khi nhân viên bấm Đăng xuất, Session ID (`sid`) lập tức được đẩy vào Redis với TTL bằng thời gian sống còn lại của JWT:
+    `SET auth:revoked:sid:<sid> "true" EX <remaining_jwt_ttl>`
+- API Gateway kiểm tra Redis filter trên mọi request đi vào. Bất kỳ request nào mang token chứa `sid` trong denylist đều bị chặn ngay tại Gateway (HTTP 401 Unauthorized), vô hiệu hóa token ngay tức thì mà không cần chờ JWT hết hạn.
+
+c. Khóa lạc quan chống xung đột cập nhật đơn hàng (Optimistic Locking `@Version`):
+- Tại `cart-order-service`, Entity `Order` được đánh dấu annotation `@Version private Long version;`.
+- Nếu 2 nhân viên (hoặc nhân viên và khách) cùng gửi lệnh đổi trạng thái đơn hàng tại cùng một mili-giây:
+  + Request 1 thực hiện thành công, `version` tăng từ 1 lên 2.
+  + Request 2 cố gắng cập nhật với `version = 1` sẽ bị ném `OptimisticLockingFailureException`.
+  + Đảm bảo không bao giờ có chuyện dữ liệu đơn hàng bị ghi đè ngầm (Lost Update).
+
+
+III. KẾT LUẬN
+----------------------------------------------------------------------------------------
+Hai giải pháp trên giải quyết trọn vẹn 2 vấn đề hóc búa nhất trong các hệ thống F&B thực tế:
+1. Đảm bảo tính toàn vẹn tài chính và hàng hóa: Không mất tiền, không trùng đơn, không âm kho ảo.
+2. Đảm bảo kỷ luật vận hành tại quầy: Minh bạch trách nhiệm ca làm việc, bảo vệ dữ liệu két tiền mặt, và loại bỏ hoàn toàn xung đột dữ liệu đa người dùng.
+========================================================================================

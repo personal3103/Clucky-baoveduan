@@ -1,0 +1,121 @@
+================================================================================
+BÁO CÁO KỸ THUẬT: CƠ CHẾ SHIPPING MÔ PHỎNG VÀ THANH TOÁN VIETQR VỚI SEPAY
+DỰ ÁN: CLUCKY – VIETNAMESE FAST-FOOD ORDERING PLATFORM
+Ngày lập: 20/11/2026
+Mã nguồn đối chiếu: backend/shipping-service, backend/payment-service, backend/cart-order-service
+================================================================================
+
+--------------------------------------------------------------------------------
+PHẦN I: SHIPPING MÔ PHỎNG (MOCK DELIVERY ENGINE) HOẠT ĐỘNG NHƯ THẾ NÀO?
+--------------------------------------------------------------------------------
+
+1. BỐI CẢNH KIẾN TRÚC & MỤC TIÊU
+- Theo quy định kiến trúc dự án Clucky (AGENTS.md), ở giai đoạn MVP hệ thống chưa tích hợp API của các đơn vị vận chuyển thứ 3 thật (như GrabExpress, Ahamove hay Be - các đơn vị này thuộc Phase 2).
+- Tuy nhiên, để hệ thống hoàn thiện luồng End-to-End (E2E) từ lúc khách đặt đơn DELIVERY, bếp nấu, đến khi shipper nhận hàng, giao hàng và hoàn tất đơn, Clucky đã xây dựng một Engine Mô phỏng Vận chuyển (MockDeliveryEngine) độc lập chạy trong shipping-service.
+- Engine này vận hành tự động dựa trên Kiến trúc hướng sự kiện (Event-Driven Architecture) qua Apache Kafka kết hợp các bộ lập lịch thời gian thực (Scheduled Jobs).
+
+2. QUY TRÌNH VẬN HÀNH 4 BƯỚC CHI TIẾT (EVENT-DRIVEN WORKFLOW)
+
+Bước 1: Tiếp nhận đơn hàng sẵn sàng giao từ Bếp
+- Khi nhân viên bếp chuẩn bị xong món ăn, cart-order-service phát sự kiện Kafka topic 'order.status-changed' với status = 'READY' và type = 'DELIVERY'.
+- Component OrderStatusChangedConsumer trong shipping-service nhận sự kiện và chuyển cho MockDeliveryEngine.acceptOrderStatus().
+- Engine kiểm tra điều kiện tiên quyết:
+  + Nếu là đơn VietQR (BANK_TRANSFER): Bắt buộc paymentStatus == 'PAID' (đã trả trước).
+  + Nếu là đơn COD: Bắt buộc paymentStatus == 'PENDING'.
+  + Nếu là đơn miễn phí (totalAmount == 0): paymentStatus == 'COLLECTED' và collectionMethod == 'NO_PAYMENT'.
+- Đơn hợp lệ được ghi nhận vào bảng 'mock_ready_orders'.
+
+Bước 2: Gán tài xế mô phỏng & Tạo lộ trình GPS (reconcileReady())
+- Định kỳ quét các đơn đang chờ trong 'mock_ready_orders'.
+- Gọi MockRouteProvider tính toán lộ trình di chuyển (khoảng cách, thời gian và tọa độ GPS giữa chi nhánh cửa hàng và địa chỉ giao hàng của khách).
+- Tạo bản ghi lượt giao hàng Attempt #1 trong bảng 'mock_delivery_attempts' với trạng thái phase = 'WAITING_RIDER'.
+- Cập nhật trạng thái bản ghi shipment thành 'ASSIGNED'.
+
+Bước 3: Tài xế nhận hàng & Di chuyển trên đường (T1: Pickup & Transit)
+- Hàm reconcileDeadlines() chạy ngầm mỗi chu kỳ 500ms (clucky.shipping.mock.tick-ms):
+- Sau 5 giây ở trạng thái chờ tài xế (WAITING_RIDER):
+  + Cơ chế ví tài xế COD (mock_rider_wallet_ledger): Đối với đơn COD, tài xế mô phỏng phải có đủ số dư ví ảo để ứng trước tiền hàng cho nhà hàng (ghi nhận thao tác DEBIT_ADVANCE). Quán ghi nhận merchantPaymentStatus = 'PAID_SIMULATED'.
+  + Chuyển phase của lượt giao sang 'SHIPPING'.
+  + Lập lịch thời gian di chuyển mô phỏng: due_at = clock_timestamp() + interval '20 seconds'.
+  + Phát sự kiện Kafka 'shipping.started'.
+  + ShippingOrderProjection bên cart-order-service lắng nghe sự kiện này và tự động chuyển trạng thái đơn hàng của khách từ READY sang SHIPPING (Đang giao hàng).
+
+Bước 4: Giao hàng thành công & Hoàn tất đơn hàng (T2: Delivered with Proof)
+- Sau 20 giây di chuyển (khi clock_timestamp() >= due_at):
+  + Hệ thống tự động sinh một bằng chứng giao hàng giả lập (proof_kind = 'SIMULATED_WATERMARK').
+  + Chuyển phase lượt giao sang 'DELIVERED'.
+  + Phát sự kiện Kafka 'shipping.delivered'.
+  + ShippingOrderProjection bên cart-order-service tiếp nhận sự kiện, xác thực bằng chứng hợp lệ và chính thức đưa đơn hàng về COMPLETED.
+  + Nhân viên tại quầy bị CHẶN TUYỆT ĐỐI không thể bấm kết thúc thủ công cho đơn DELIVERY.
+
+3. MÔ PHỎNG CÁC TÌNH HUỐNG NGOẠI LỆ (STAFF INTERVENTIONS)
+- Controller MockDeliveryController cung cấp các API hỗ trợ kiểm thử và xử lý sự cố:
+  + Giao thất bại (fail): Khách không nghe máy, địa chỉ sai -> phase = 'FAILED', đơn chờ quản lý xử lý.
+  + Giao lại (retry): Quản lý liên hệ lại được khách -> tạo Attempt mới để giao lại.
+  + Trả hàng về quán (returned): Hàng hoàn về chi nhánh -> hoàn lại tiền ví tài xế (CREDIT_RETURN), merchantPaymentStatus = 'ADVANCE_RETURNED'.
+  + Đóng đơn không giao được (close): Đưa đơn về DELIVERY_FAILED.
+
+4. CÁC FILE MÃ NGUỒN CHÍNH (SHIPPING SIMULATION):
+- Engine lõi: backend/shipping-service/src/main/java/com/clucky/shippingservice/service/MockDeliveryEngine.java
+- Lộ trình: backend/shipping-service/src/main/java/com/clucky/shippingservice/service/MockRouteProvider.java
+- Consumer sự kiện: OrderCreatedConsumer.java, OrderStatusChangedConsumer.java
+- Phản chiếu trạng thái sang Order: backend/cart-order-service/src/main/java/com/clucky/cartorderservice/service/ShippingOrderProjection.java
+
+
+--------------------------------------------------------------------------------
+PHẦN II: THANH TOÁN VIETQR VỚI SEPAY HOẠT ĐỘNG NHƯ THẾ NÀO?
+--------------------------------------------------------------------------------
+
+1. SEPAY LÀ GÌ VÀ VAI TRÒ TRONG HỆ THỐNG?
+- SePay là giải pháp cổng thanh toán tự động lắng nghe biến động số dư tài khoản ngân hàng (Techcombank, Vietcombank, MB Bank, ACB, v.v.). Khi có tiền vào tài khoản ngân hàng của cửa hàng kèm nội dung chuyển khoản, SePay gửi ngay một HTTP Webhook (POST) về Clucky.
+- Hệ thống kết hợp chuẩn VietQR (chuẩn mã QR thanh toán Napas247 của Ngân hàng Nhà nước Việt Nam) để khách hàng chỉ cần mở ứng dụng ngân hàng bất kỳ, quét mã là số tài khoản, số tiền và nội dung chuyển khoản được điền chính xác 100%.
+
+2. LUỒNG THANH TOÁN VIETQR TRỰC TUYẾN (ONLINE CUSTOMER CHECKOUT)
+
+Bước 1: Khởi tạo phiên thanh toán (PaymentFlow.java)
+- Khách hàng chọn BANK_TRANSFER khi đặt đơn trên Web.
+- payment-service kiểm tra tài khoản ngân hàng được cấu hình riêng cho chi nhánh (bảng payment_service.store_bank_accounts).
+- Sinh một mã nội dung chuyển khoản duy nhất (transfer_content qua TransferReference.create(storeId) - ví dụ: CKY101...).
+- Lưu bản ghi vào bảng payment_service.payments với trạng thái status = 'PENDING' và thời hạn thanh toán 15 phút (expires_at).
+
+Bước 2: Render mã VietQR chuẩn trên Frontend (vietqr.ts)
+- Frontend Next.js tạo URL ảnh mã QR động theo chuẩn VietQR Quick Link:
+  https://img.vietqr.io/image/{bankCode}-{accountNo}-qr_only.svg?amount={amount}&addInfo={transfer_content}&accountName={accountName}
+- Mã QR hiển thị trên màn hình khách kèm đồng hồ đếm ngược 15 phút.
+
+Bước 3: Khách quét QR & Tiếp nhận Webhook từ SePay (SepayWebhookSecurity.java)
+- Khách quét mã và bấm chuyển khoản trên ứng dụng ngân hàng.
+- Tài khoản ngân hàng chi nhánh nhận tiền -> SePay phát hiện biến động số dư.
+- SePay gửi Webhook POST đến: /api/payments/webhook/sepay.
+- Bảo mật Webhook: SepayWebhookSecurity kiểm tra header 'Authorization: Apikey <SECRET_KEY>' bằng thuật toán so sánh an toàn thời gian (MessageDigest.isEqual) để chống tấn công giả mạo (Timing Attack).
+
+Bước 4: Khớp giao dịch & Chống xử lý trùng lặp (SepayReceiptService.java)
+- Chống lặp (Idempotency): Giao dịch được lưu vào bảng bank_transactions với khóa duy nhất bank_tx_id = 'SEPAY:' + id.
+- Nếu SePay retry gửi lại cùng một giao dịch (do timeout mạng), hệ thống kiểm tra webhook_fingerprint (mã băm SHA-256 nội dung), chỉ tăng replay_count chứ tuyệt đối không xử lý cộng tiền lần hai.
+- Hệ thống dùng Regular Expression quét nội dung chuyển khoản (content) để bóc tách mã đơn hàng orderCode hoặc mã tham chiếu transfer_content.
+
+Bước 5: Kích hoạt đơn hàng qua Kafka (OrderPaymentService.java)
+- payment-service phát sự kiện Kafka 'payment.received' chứa snapshot thanh toán.
+- cart-order-service tiếp nhận sự kiện:
+  + So khớp số tiền thực nhận >= số tiền của đơn hàng.
+  + Kiểm tra thời hạn 15 phút của đơn (chưa hết hạn).
+  + Cập nhật paymentStatus = 'PAID'.
+  + Chuyển trạng thái đơn sang 'CONFIRMED'.
+- Màn hình khách hàng (đang polling kiểm tra trạng thái) nhận diện đơn đã thanh toán thành công và tự động chuyển sang giao diện theo dõi món ăn đang được bếp chế biến.
+
+3. THANH TOÁN VIETQR TẠI QUẦY POS (BÁN HÀNG TRỰC TIẾP)
+- Màn hình POS hỗ trợ: Thanh toán VietQR toàn bộ hoặc Thanh toán kết hợp SPLIT (1 phần tiền mặt, 1 phần VietQR).
+- payment-service tạo biên lai thu ngân quầy (counter_payment_receipts) ở trạng thái PENDING_RECONCILIATION.
+- Màn hình POS tự động polling mỗi 6 giây. Khi SePay gửi webhook về khớp đúng số tiền và mã đơn, biên lai chuyển sang RECONCILED.
+- Quy tắc bảo vệ dòng tiền: Thu ngân KHÔNG THỂ tự ý bấm 'Xác nhận chuyển khoản' bằng tay nếu không có webhook thật từ ngân hàng, loại bỏ 100% nguy cơ khách đưa ảnh chụp màn hình giả mạo.
+
+4. CÁC FILE MÃ NGUỒN CHÍNH (VIETQR & SEPAY):
+- Khởi tạo phiên thanh toán: backend/payment-service/src/main/java/com/clucky/paymentservice/service/PaymentFlow.java
+- Xử lý webhook & đối soát: backend/payment-service/src/main/java/com/clucky/paymentservice/service/SepayReceiptService.java
+- Bảo mật Webhook ApiKey: backend/payment-service/src/main/java/com/clucky/paymentservice/config/SepayWebhookSecurity.java
+- Tạo đường dẫn VietQR Quick Link: frontend/nextjs/lib/vietqr.ts, frontend/react/src/lib/vietqr.ts
+- Nhận event thanh toán sang Order: backend/cart-order-service/src/main/java/com/clucky/cartorderservice/service/OrderPaymentService.java
+
+================================================================================
+HẾT BÁO CÁO
+================================================================================

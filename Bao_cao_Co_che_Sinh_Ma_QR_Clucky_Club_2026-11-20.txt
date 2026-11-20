@@ -1,0 +1,192 @@
+========================================================================================
+BÁO CÁO KỸ THUẬT: CƠ CHẾ SINH VÀ QUẢN LÝ MÃ QR CLUCKY CLUB DYNAMIC LIVE LOYALTY
+Hệ thống: Clucky Platform - Nền tảng Đặt đồ ăn nhanh Đa dịch vụ
+Ngày lập: 20/11/2026
+Màn hình nghiệp vụ: Giao diện Khách hàng (Customer Next.js) - URL: /loyalty
+Các service phụ trách: Frontend Next.js (Customer UI) & Backend Promotion-Loyalty-Service
+========================================================================================
+
+I. ĐẶT VẤN ĐỀ VÀ BỐI CẢNH NGHIỆP VỤ (BUSINESS CONTEXT)
+----------------------------------------------------------------------------------------
+Trong mô hình kinh doanh F&B chuỗi (như Clucky), bài toán tích và tiêu điểm thành viên tại
+quầy POS (Offline Dining / Takeaway) đối mặt với hai rủi ro bảo mật cốt lõi:
+1. Rủi ro gian lận điểm (Fraud & Point Theft):
+   - Nếu dùng mã tĩnh (như số điện thoại hay thẻ mã vạch tĩnh), kẻ gian hoặc người ngoài nhìn
+     thấy có thể đọc trộm mã để trừ hết điểm tích lũy của khách hàng hợp pháp.
+   - Nhân viên thu ngân thông đồng hoặc vô tình trừ điểm của khách mà không có sự hiện diện thực.
+2. Tấn công Replay Attack (Chụp màn hình mã QR gửi cho người khác):
+   - Khách chụp lại mã QR đưa người khác đi tiêu điểm hộ khi không có mặt trực tiếp.
+
+Giải pháp của Clucky:
+Hệ thống "Dynamic Live Loyalty Presence" - Cấp quyền dựa trên sự hiện diện thời gian thực.
+- Mã chỉ tồn tại trong phiên xem trang (Page-Mounted Presence).
+- Mã QR và Mã chữ tự động xoay vòng (Rotate) mỗi chu kỳ 30 giây (CYCLE = 30s).
+- Tách biệt hoàn toàn hai quyền hạn: Quyền Tích Điểm (Earn-Only) và Quyền Tiêu Điểm (Redeem).
+
+
+II. BÓC TÁCH GIAO DIỆN THỰC TẾ TRÊN MÀN HÌNH (SCREENSHOT ANALYSIS)
+----------------------------------------------------------------------------------------
+Tại URL `https://31.58.103.66/loyalty`, khối "Mã Clucky Club của bạn" hiển thị các thành phần:
+
+1. Mã QR Động (Dynamic Vector QR):
+   - Render dưới dạng SVG vector độ phân giải cao bằng thư viện `qrcode.react` (`<QRCodeSVG>`).
+   - Mã hóa chuỗi bảo mật cấp quyền tối đa `CLUCKY:LOYALTY:V1:<random-token>` (256 bits entropy).
+   - Dùng để nhân viên dùng súng quét mã POS quét: Cả TÍCH ĐIỂM và TRỪ ĐIỂM.
+
+2. Mã chữ dự phòng (Typed Loyalty Code - ví dụ: `LY-IO2DTG75H_P6GAPJ`):
+   - Mã gồm tiền tố "LY-" kết hợp chuỗi ngẫu nhiên 12 ký tự Base64 URL-safe in hoa.
+   - Thiết kế dành cho trường hợp camera POS bị lỗi hoặc quầy không có máy quét QR.
+   - NGUYÊN TẮC BẢO MẬT TUYỆT ĐỐI: "Mã chữ chỉ dùng để tích điểm; không thể trừ điểm."
+     Dù bị người đứng cạnh nhìn thấy hay chụp lén, kẻ xấu KHÔNG THỂ dùng mã chữ để rút điểm.
+
+3. Nút bấm tương tác "Sao chép mã":
+   - Hỗ trợ khách hàng copy mã chữ nhanh vào clipboard để gửi hoặc nhập ứng dụng khác.
+
+4. Đồng hồ đếm ngược và thanh tiến trình (Countdown Bar):
+   - Hiển thị text: "Mã mới sau 18 giây" (hoặc X giây còn lại của chu kỳ 30 giây).
+   - Thanh tiến trình trực quan co ngắn dần theo thời gian thực (0% - 100%).
+   - Thông điệp cảnh báo: "Mã QR và mã chữ tự đổi khi hết hạn trong lúc bạn đang ở trang này."
+
+
+III. KIẾN TRÚC VÀ CƠ CHẾ XỬ LÝ TẠI FRONTEND NEXT.JS
+----------------------------------------------------------------------------------------
+Vị trí mã nguồn: `frontend/nextjs/components/loyalty/live-loyalty-code.tsx`
+
+1. Vòng đời khởi tạo phiên hiển thị (Component Mounting):
+   - Khi khách hàng truy cập trang `/loyalty`, component gọi API `loyaltyApi.open()`
+     tương ứng endpoint `POST /api/loyalty/live-session/open`.
+   - Backend phản hồi `CurrentCode` gồm: `sessionId`, `loyaltyTextCode`, `loyaltyQrToken`,
+     `issuedAt`, `expiresAt`, `serverTime`.
+
+2. Thuật toán chống lệch giờ hệ thống (Anti-Clock Skew Synchronization):
+   - Điện thoại của người dùng có thể bị chạy nhanh hoặc chậm vài phút so với thực tế.
+     Nếu dùng `Date.now()` của client để tính hạn, mã sẽ bị hiển thị sai hạn dùng.
+   - Frontend Clucky tính toán độ lệch đồng hồ máy chủ (time offset) ngay khi nhận mã:
+       timeOffset = Date.parse(response.serverTime) - Date.now()
+       accurateNow = Date.now() + timeOffset
+       remainingSeconds = Math.max(0, Math.ceil((Date.parse(expiresAt) - accurateNow) / 1000))
+   - Timer kiểm tra tick mỗi 250ms để cập nhật mượt mà thanh tiến trình `timeProgress`.
+
+3. Cơ chế ẩn mã tức thì (Zero-Leakage Expire):
+   - Ngay khoảnh khắc `remainingSeconds === 0`:
+     Component lập tức gọi `setCurrent(null)` để XÓA NGAY LẬP TỨC mã QR khỏi DOM màn hình.
+     Điều này ngăn triệt để việc thu ngân quét phải một mã QR vừa quá hạn 1-2 giây.
+   - Đồng thời, frontend kích hoạt gọi API `loyaltyApi.rotate(sessionId)` để nhận cặp mã mới.
+
+4. Cơ chế duy trì phiên và đóng phiên (Heartbeat & Keepalive Close):
+   - Heartbeat: Mỗi 3 giây (`setInterval 3000ms`), frontend bắn `POST /api/loyalty/live-session/heartbeat`
+     để báo cho Redis biết khách hàng vẫn đang đứng trước màn hình.
+   - Auto Close: Khi người dùng bấm chuyển trang, đăng xuất hoặc tắt tab (`pagehide`, `beforeLogout`),
+     hệ thống gọi API `close` thông qua `fetch` với cờ `keepalive: true` và `AbortSignal.timeout(2000)`.
+     Đảm bảo phiên bị dọn dẹp khỏi Redis ngay cả khi trình duyệt đã đóng.
+
+
+IV. THIẾT KẾ BACKEND & LƯU TRỮ PHÂN TÁN TẠI REDIS
+----------------------------------------------------------------------------------------
+Vị trí mã nguồn:
+- Controller: `backend/promotion-loyalty-service/src/main/java/.../controller/LiveLoyaltyController.java`
+- Service: `backend/promotion-loyalty-service/src/main/java/.../service/LiveLoyaltySessionService.java`
+
+1. Cấu trúc lưu trữ trong Redis (Dual-Storage & Inverted Hash Index):
+   Không bao giờ lưu mã bí mật dạng plain-text lâu dài. Toàn bộ mã tra cứu đều được băm SHA-256.
+
+   a. Hash phiên làm việc (Session Hash):
+      Key: `loyalty:session:<sessionId>`
+      Fields:
+      - customerId: ID khách hàng sở hữu
+      - generation: Số thứ tự thế hệ mã (bắt đầu từ 1, tăng dần 2, 3... mỗi lần xoay)
+      - issuedAt: Thời điểm cấp (ISO-8601)
+      - expiresAt: Thời điểm hết hạn (issuedAt + 30 giây)
+      - textHash: SHA-256(loyaltyTextCode)
+      - qrHash: SHA-256(loyaltyQrToken)
+      TTL: 70 giây (`LEASE = Duration.ofSeconds(70)`) - Đủ cho 1 chu kỳ 30s và dung sai mạng.
+
+   b. Khóa ràng buộc phiên duy nhất (Single Active Tab Lock):
+      Key: `loyalty:active:<customerId>` -> Lưu giá trị `<sessionId>`
+      - Sử dụng Redis Lua script `OPEN_SCRIPT`:
+        Khi khách mở một tab mới, phiên cũ ở tab trước sẽ bị xóa ngay (`redis.call('DEL')`).
+        Đảm bảo mỗi khách hàng tại một thời điểm CHỈ CÓ MỘT MÃ ĐANG HOẠT ĐỘNG DUY NHẤT.
+
+   c. Bảng tra cứu ngược siêu tốc (Fast Inverted Credential Indexes):
+      Key 1: `loyalty:text:<SHA-256(textCode)>` -> Giá trị: `<sessionId>:<generation>` (TTL = 30s)
+      Key 2: `loyalty:qr:<SHA-256(qrToken)>`     -> Giá trị: `<sessionId>:<generation>` (TTL = 30s)
+
+2. Độ mạnh mật mã học (Cryptographic Entropy):
+   - Text Code: `LY-` + `random(12)` -> Hơn 80 bits entropy ngẫu nhiên (chống brute force).
+   - QR Token: `CLUCKY:LOYALTY:V1:` + `random(32)` -> Đạt 256 bits entropy mật mã học sinh từ `SecureRandom`.
+   - Kẻ gian hoàn toàn không thể đoán hoặc rà quét trúng mã hợp lệ trong cửa sổ 30 giây.
+
+3. Tính nguyên tử khi Xoay mã (Atomic CAS Rotation qua Lua Script):
+   Khi nhận request `POST /api/loyalty/live-session/rotate`, hàm thực thi kịch bản `ROTATE_SCRIPT`:
+   ```lua
+   if redis.call('HGET', KEYS[1], 'generation') ~= ARGV[1]
+      or redis.call('HGET', KEYS[1], 'expiresAt') ~= ARGV[2] then
+       return 0
+   end
+   redis.call('HSET', KEYS[1],
+       'generation', ARGV[3],
+       'issuedAt', ARGV[4],
+       'expiresAt', ARGV[5],
+       'textHash', ARGV[6],
+       'qrHash', ARGV[7])
+   redis.call('PEXPIRE', KEYS[1], ARGV[8])
+   return 1
+   ```
+   -> Nếu có 2 request rotate song song hoặc phiên đã bị thay đổi ở tab khác, script từ chối ngay.
+
+
+V. BẢO MẬT QUÉT TẠI QUẦY THU NGÂN (CASHIER POS SCAN & ANTI-THEFT)
+----------------------------------------------------------------------------------------
+Khi khách hàng đưa mã QR trên màn hình cho nhân viên thu ngân quét:
+API xử lý: `POST /api/loyalty/counter/loyalty/scan`
+
+1. Cơ chế Chống Replay bằng `GETDEL` (Atomic One-Time Use):
+   Trong `LiveLoyaltySessionService.java`:
+     `String entry = redis.opsForValue().getAndDelete(credentialKey("qr", qrToken));`
+   - Lệnh Redis `getAndDelete` lấy thông tin phiên đồng thời XÓA NGAY LẬP TỨC khóa khỏi Redis.
+   - Bất kỳ nỗ lực nào quét lại mã QR đó lần thứ hai (kể cả trong vòng 1 miligiây) đều bị ném lỗi:
+     `ConflictException("Loyalty QR expired or already scanned")`.
+
+2. Ràng buộc bằng chứng quét (Cryptographic Scan Proof) trong Cơ sở dữ liệu:
+   Sau khi quét QR hợp lệ, hệ thống không cấp quyền vĩnh viễn mà sinh một bằng chứng quét:
+   - Lưu vào bảng PostgreSQL `promotion_service.loyalty_scan_proofs`:
+     + proof_hash: SHA-256 của chuỗi token ngẫu nhiên `proof` (32 bytes).
+     + customer_id: ID khách hàng
+     + session_id: ID phiên hiển thị
+     + staff_id: ID nhân viên quét
+     + store_id: Cửa hàng đang phục vụ
+     + draft_hash: Mã băm SHA-256 của giỏ hàng/đơn nháp tại quầy
+     + expires_at: Hết hạn sau đúng 30 giây.
+   - Ý nghĩa: Ngăn chặn triệt để hành vi nhân viên quét QR của khách này nhưng lại áp dụng
+     giảm giá / trừ điểm cho đơn hàng của khách hàng khác.
+
+3. Cơ chế Chặn Brute Force (Staff Rate Limiting):
+   Để ngăn chặn nhân viên quét bừa hoặc rà quét mã, hệ thống áp dụng rate limiter:
+   - Key Redis: `loyalty:throttle:scan:<staffId>:<storeId>:<minute>`
+   - Giới hạn: Tối đa 30 lần quét/phút cho mỗi nhân viên.
+   - Vượt ngưỡng sẽ ném mã lỗi HTTP 429 `TOO_MANY_REQUESTS`.
+
+
+VI. TỔNG KẾT BẢNG SO SÁNH GIỮA HAI LOẠI MÃ TRÊN GIAO DIỆN
+----------------------------------------------------------------------------------------
+Đặc điểm                       Mã QR (Live QR Code)            Mã chữ (Typed Text Code)
+-----------------------------  ------------------------------  ---------------------------------
+Ví dụ hiển thị                 Ma trận 2D SVG vector           LY-IO2DTG75H_P6GAPJ
+Độ dài Entropy                 256 bits mật mã học             > 80 bits Base64 URL-safe
+Cách thức nhận diện            Súng quét POS / Camera quét     Thu ngân gõ bàn phím POS
+Quyền TÍCH ĐIỂM (Earn Points)  CÓ (Cho phép)                   CÓ (Cho phép)
+Quyền TRỪ ĐIỂM (Redeem Points) CÓ (Yêu cầu quét QR trực tiếp)  KHÔNG ĐƯỢC PHÉP (Bảo vệ điểm)
+Thời gian hiệu lực             Tự động xoay sau 30 giây        Tự động xoay sau 30 giây
+Cơ chế tiêu thụ mã             GETDEL (Xóa ngay sau 1 lần)     Tra cứu theo thế hệ (Generation)
+Rủi ro nhìn trộm               Gần như không (quét trực tiếp)  Không lo bị mất điểm tích lũy
+
+
+VII. KẾT LUẬN
+----------------------------------------------------------------------------------------
+Cơ chế sinh mã QR Clucky Club Live Loyalty là sự kết hợp chặt chẽ giữa:
+1. Trải nghiệm người dùng mượt mà trên Next.js (SVG sắc nét, đồng bộ thời gian không lệch giờ,
+   thanh đếm ngược 30 giây trực quan).
+2. Tốc độ phản hồi cực nhanh nhờ Redis In-Memory caching (đáp ứng mili-giây tại quầy thu ngân).
+3. Kiến trúc bảo mật đa tầng chuẩn Enterprise (phân tách quyền tích/tiêu điểm, atomic GETDEL
+   chống replay, SHA-256 hash draft binding ngăn tráo đơn, và rate limiting chống dò mã).
+========================================================================================
